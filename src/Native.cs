@@ -262,6 +262,50 @@ namespace UsbGuard
         public static extern bool DeviceIoControl(SafeFileHandle h, uint code, IntPtr inBuf, uint inSize,
             out STORAGE_DEVICE_NUMBER outBuf, uint outSize, out uint returned, IntPtr overlapped);
 
+        // ---- volumes / drive letters (pending USB drives are kept without a letter) ----
+        public static readonly Guid GUID_DEVINTERFACE_VOLUME = new Guid("53f5630d-b6bf-11d0-94f2-00a0c91efb8b");
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool GetVolumeNameForVolumeMountPointW(string mountPoint, StringBuilder volumeName, int len);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool GetVolumePathNamesForVolumeNameW(string volumeName, char[] buf, int len, out int needed);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool DeleteVolumeMountPointW(string mountPoint);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool SetVolumeMountPointW(string mountPoint, string volumeName);
+
+        [DllImport("kernel32.dll")]
+        public static extern uint GetLogicalDrives();
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool GetVolumeInformationW(string root, StringBuilder label, int labelLen, out uint serial,
+            out uint maxComponent, out uint fsFlags, StringBuilder fsName, int fsNameLen);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool GetDiskFreeSpaceExW(string dir, out ulong freeToCaller, out ulong total, out ulong totalFree);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct WIN32_FIND_DATA
+        {
+            public uint dwFileAttributes;
+            public uint ftCreationLow, ftCreationHigh, ftAccessLow, ftAccessHigh, ftWriteLow, ftWriteHigh; // FILETIMEs (4-byte aligned)
+            public uint nFileSizeHigh, nFileSizeLow, dwReserved0, dwReserved1;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string cFileName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)] public string cAlternateFileName;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr FindFirstFileW(string name, out WIN32_FIND_DATA data);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool FindNextFileW(IntPtr h, out WIN32_FIND_DATA data);
+
+        [DllImport("kernel32.dll")]
+        public static extern bool FindClose(IntPtr h);
+
         // ---- key translation ----
         [DllImport("user32.dll")]
         public static extern int ToUnicodeEx(uint vk, uint scan, byte[] state, [Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder buf, int cch, uint flags, IntPtr hkl);

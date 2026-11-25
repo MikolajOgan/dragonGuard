@@ -24,6 +24,10 @@ namespace UsbGuard
         readonly Dictionary<string, PromptForm> pending = new Dictionary<string, PromptForm>(StringComparer.OrdinalIgnoreCase);
         readonly List<PromptForm> order = new List<PromptForm>();
         readonly Dictionary<string, KeyValuePair<char, ScanResult>> lateScans = new Dictionary<string, KeyValuePair<char, ScanResult>>(StringComparer.OrdinalIgnoreCase);
+        // Drives without a letter (kept locked until approval) whose approval window isn't open yet: phys -> volumes.
+        readonly Dictionary<string, HashSet<string>> lateVolumes = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        // Volumes whose letter this agent removed itself (service not reachable): volume -> phys.
+        readonly Dictionary<string, string> localLocked = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         readonly HashSet<string> kbServiceDisabled = new HashSet<string>(StringComparer.OrdinalIgnoreCase); // keyboard switched off by service
         readonly HashSet<string> kbEnabled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);         // switched on for arrow approval
         readonly Dictionary<string, System.Windows.Forms.Timer> awaiting = new Dictionary<string, System.Windows.Forms.Timer>(StringComparer.OrdinalIgnoreCase);
@@ -191,6 +195,9 @@ namespace UsbGuard
                 case "DECIDED":
                     if (m.Length >= 4) { string p = m[1], st = m[2], err = m[3]; Post(() => OnServiceDecided(p, st == "A", err)); }
                     break;
+                case "VOLUME":  // VOLUME phys \\?\Volume{guid}\  - drive kept without a letter until approval
+                    if (m.Length >= 3) { string p = m[1], v = m[2]; Post(() => OnLockedVolume(p, v)); }
+                    break;
                 case "GONE":
                     if (m.Length >= 2) { string p = m[1]; Post(() => { PromptForm f; if (pending.TryGetValue(p, out f)) { Guard.Log("Device unplugged before a decision: " + f.DevName + CapturedSuffix(f)); Close(f); } }); }
                     break;
@@ -274,7 +281,9 @@ namespace UsbGuard
                 if (e.Kind == IfaceKind.Network || e.Kind == IfaceKind.Pointer)
                     Balloon("DragonGuard", "New " + (e.Kind == IfaceKind.Network ? "USB network adapter" : "mouse/pointer") + " was switched off until you approve it: " + e.Name, ToolTipIcon.Warning);
                 KeyValuePair<char, ScanResult> late;
-                if (lateScans.TryGetValue(e.Phys, out late)) { lateScans.Remove(e.Phys); f.AddDrive(late.Key); f.SetScan(late.Key, late.Value); }
+                if (lateScans.TryGetValue(e.Phys, out late)) { lateScans.Remove(e.Phys); f.AddDrive(late.Key + ":"); f.SetScan(late.Key + ":", late.Value); }
+                HashSet<string> vols;
+                if (lateVolumes.TryGetValue(e.Phys, out vols)) { lateVolumes.Remove(e.Phys); foreach (string v in vols) ScanLockedVolume(f, v); }
             }
             if (e.MouseHeld) { Guard.HoldMouse(e.Phys); Guard.Hold(e.Phys); }
             f.AddInterface(e);
@@ -282,17 +291,54 @@ namespace UsbGuard
             KeepFocusAway();
         }
 
+        /// <summary>A drive of an untrusted device that has no drive letter: show it in its window and scan it.</summary>
+        void OnLockedVolume(string phys, string vol)
+        {
+            PromptForm f;
+            if (pending.TryGetValue(phys, out f)) { ScanLockedVolume(f, vol); return; }
+            if (Guard.GetState(phys) == DevState.Blocked) return;
+            HashSet<string> set;
+            if (!lateVolumes.TryGetValue(phys, out set)) lateVolumes[phys] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            set.Add(vol);
+        }
+
+        void ScanLockedVolume(PromptForm f, string vol)
+        {
+            const string display = "no drive letter until allowed";
+            if (!f.AddDrive(display, true)) return; // already scanned
+            RunScan(() => Scanner.Scan(vol, "(" + display + ")"), r =>
+            {
+                if (!f.IsDisposed) f.SetScan(display, r);
+                if (r.Suspicious) Guard.Log("Scan: suspicious content on the drive of pending device " + f.DevName);
+            });
+        }
+
         void OnVolume(char letter, string phys)
         {
+            DevState st = phys == null ? DevState.Allowed : Guard.GetState(phys);
+            if (st == DevState.Blocked) return;
+            if (st != DevState.Allowed)
+            {
+                // Not trusted (yet): the drive must not be usable. The service removes the letter and sends VOLUME;
+                // without the service we do it ourselves (we run elevated / as SYSTEM).
+                if (Client.IsConnected) return;
+                string vol = Volumes.NameOf(letter + @":\");
+                if (vol != null && Volumes.HideLetters(vol).Length > 0)
+                {
+                    localLocked[vol] = phys;
+                    Guard.Log("Removed drive letter " + letter + ": of untrusted USB drive until approval (service not reachable)  [" + phys + "]");
+                    OnLockedVolume(phys, vol);
+                    return;
+                }
+            }
             PromptForm f;
             if (phys != null && pending.TryGetValue(phys, out f))
             {
-                f.AddDrive(letter);
-                RunScan(letter, r => { if (!f.IsDisposed) f.SetScan(letter, r); if (r.Suspicious) Guard.Log("Scan " + letter + ": suspicious content on pending device " + f.DevName); });
+                string d = letter + ":";
+                f.AddDrive(d);
+                RunScan(letter, r => { if (!f.IsDisposed) f.SetScan(d, r); if (r.Suspicious) Guard.Log("Scan " + letter + ": suspicious content on pending device " + f.DevName); });
                 return;
             }
-            DevState st = phys == null ? DevState.Allowed : Guard.GetState(phys);
-            if (st == DevState.Blocked) return;
             bool removable = false;
             try { removable = new DriveInfo(letter + ":\\").DriveType == DriveType.Removable; } catch { }
             if (phys == null && !removable) return;
@@ -300,7 +346,7 @@ namespace UsbGuard
             RunScan(letter, r =>
             {
                 PromptForm pf;
-                if (phys != null && pending.TryGetValue(phys, out pf)) { pf.AddDrive(letter); pf.SetScan(letter, r); return; }
+                if (phys != null && pending.TryGetValue(phys, out pf)) { pf.AddDrive(letter + ":"); pf.SetScan(letter + ":", r); return; }
                 if (phys != null && Guard.GetState(phys) == DevState.Unknown) { lateScans[phys] = new KeyValuePair<char, ScanResult>(letter, r); return; }
                 if (!r.Suspicious) return;
                 Guard.Log("Suspicious content on drive " + letter + ": (allowed device)\r\n" + r.Report);
@@ -311,10 +357,15 @@ namespace UsbGuard
 
         void RunScan(char letter, Action<ScanResult> done)
         {
+            RunScan(() => Scanner.Scan(letter), done);
+        }
+
+        void RunScan(Func<ScanResult> scan, Action<ScanResult> done)
+        {
             ThreadPool.QueueUserWorkItem(_ =>
             {
                 ScanResult r;
-                try { r = Scanner.Scan(letter); }
+                try { r = scan(); }
                 catch (Exception ex) { r = new ScanResult { Report = "Scan failed: " + ex.Message }; }
                 Post(() => done(r));
             });
@@ -374,6 +425,11 @@ namespace UsbGuard
             {
                 Guard.SetMirror(phys, f.DevName, mode == "O" ? 'O' : 'S');
                 foreach (string inst in f.ToEnable) Dev.EnableInstance(inst);
+                foreach (var kv in localLocked.Where(x => string.Equals(x.Value, phys, StringComparison.OrdinalIgnoreCase)).ToList())
+                {
+                    localLocked.Remove(kv.Key);
+                    Volumes.GiveLetter(kv.Key);
+                }
                 Guard.Log("ALLOWED locally (" + why + "): " + f.DevName);
                 Close(f);
                 return;

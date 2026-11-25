@@ -68,6 +68,8 @@ namespace UsbGuard
         readonly BlockingCollection<Action> queue = new BlockingCollection<Action>();
         readonly Dictionary<string, Pending> pending = new Dictionary<string, Pending>(StringComparer.OrdinalIgnoreCase);
         readonly HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Volumes of not-yet-trusted USB drives kept without a drive letter: \\?\Volume{guid}\ -> physical device.
+        readonly Dictionary<string, string> lockedVolumes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         readonly List<Native.CM_NOTIFY_CALLBACK> callbacks = new List<Native.CM_NOTIFY_CALLBACK>(); // keep alive
         readonly PipeServer server = new PipeServer();
         readonly AgentLauncher launcher;
@@ -101,6 +103,7 @@ namespace UsbGuard
             Register(Native.GUID_DEVINTERFACE_HID, p => OnHid(p));
             Register(Native.GUID_DEVINTERFACE_NET, p => OnNet(p));
             Register(Native.GUID_DEVINTERFACE_DISK, p => OnDisk(p));
+            Register(Native.GUID_DEVINTERFACE_VOLUME, p => OnVolume(p, 0));
 
             // Devices present at start (boot, service restart).
             queue.Add(() =>
@@ -108,6 +111,7 @@ namespace UsbGuard
                 foreach (string p in Dev.GetPresentInterfaces(Native.GUID_DEVINTERFACE_HID)) OnHid(p);
                 foreach (string p in Dev.GetPresentInterfaces(Native.GUID_DEVINTERFACE_NET)) OnNet(p);
                 foreach (string p in Dev.GetPresentInterfaces(Native.GUID_DEVINTERFACE_DISK)) OnDisk(p);
+                foreach (string p in Dev.GetPresentInterfaces(Native.GUID_DEVINTERFACE_VOLUME)) OnVolume(p, 0);
                 launcher.EnsureAllSessions();
             });
 
@@ -159,7 +163,67 @@ namespace UsbGuard
                     server.Broadcast("GONE", p.Phys);
                 }
             CheckOnceAllowed();
+            RecheckLockedVolumes();
             if (++tick % 5 == 0) launcher.EnsureAllSessions(); // restart crashed agents
+        }
+
+        void Later(int ms, Action a)
+        {
+            System.Threading.Tasks.Task.Delay(ms).ContinueWith(_ => { try { queue.Add(a); } catch { } });
+        }
+
+        // ------------------------------------------------------------------
+        /// <summary>
+        /// A volume appeared. If it belongs to a USB device that is not allowed (yet), remove its drive letter so it
+        /// can't be opened until the user trusts it; the agent scans it through the volume name instead.
+        /// </summary>
+        void OnVolume(string path, int attempt)
+        {
+            string vol = Volumes.NameOf(path);
+            string phys = vol == null ? null : Dev.PhysForVolume(vol);
+            if (vol == null || phys == null)
+            {
+                // Right after arrival the volume may not be registered with the mount manager yet.
+                if (attempt < 8 && Dev.GetPresentInterfaces(Native.GUID_DEVINTERFACE_VOLUME).Contains(path, StringComparer.OrdinalIgnoreCase))
+                    Later(250, () => OnVolume(path, attempt + 1));
+                return;
+            }
+            if (!phys.StartsWith(@"USB\", StringComparison.OrdinalIgnoreCase)) return;
+            LockVolume(vol, phys);
+            // The mount manager can hand out the letter a moment after the interface arrives: check again.
+            if (attempt == 0) foreach (int ms in new[] { 300, 1000 }) Later(ms, () => LockVolume(vol, phys));
+        }
+
+        void LockVolume(string vol, string phys)
+        {
+            if (Guard.GetState(phys) == DevState.Allowed) return;
+            if (Dev.Locate(phys) == 0) { lockedVolumes.Remove(vol); return; }
+            string removed = Volumes.HideLetters(vol);
+            bool isNew = !lockedVolumes.ContainsKey(vol);
+            lockedVolumes[vol] = phys;
+            if (removed.Length > 0)
+                Guard.Log("Removed drive letter " + removed + " of untrusted USB drive until approval  [" + phys + "]");
+            if (isNew) server.Broadcast("VOLUME", phys, vol);
+        }
+
+        void RecheckLockedVolumes()
+        {
+            foreach (var kv in lockedVolumes.ToList())
+            {
+                if (Dev.Locate(kv.Value) == 0 || Dev.PhysForVolume(kv.Key) == null) { lockedVolumes.Remove(kv.Key); continue; }
+                LockVolume(kv.Key, kv.Value);
+            }
+        }
+
+        /// <summary>The device was allowed: give its drives a letter back.</summary>
+        void UnlockVolumes(string phys)
+        {
+            foreach (var kv in lockedVolumes.Where(x => string.Equals(x.Value, phys, StringComparison.OrdinalIgnoreCase)).ToList())
+            {
+                lockedVolumes.Remove(kv.Key);
+                char? l = Volumes.GiveLetter(kv.Key);
+                if (l != null) Guard.Log("Drive of allowed device is now available as " + l + ":  [" + phys + "]");
+            }
         }
 
         /// <summary>"Allow once" lasts only while the device stays plugged in.</summary>
@@ -337,6 +401,7 @@ namespace UsbGuard
                         c.Send("STATE", e.Id, e.Name, Guard.StateChar(e.Id).ToString());
                     foreach (var pp in pending.Values)
                         foreach (var f in pp.Funcs) c.Send(PendingMsg(pp, f));
+                    foreach (var kv in lockedVolumes) c.Send("VOLUME", kv.Value, kv.Key);
                     c.Send("SYNCED");
                     break;
 
@@ -381,6 +446,7 @@ namespace UsbGuard
                         }
                     }
                     SendState(phys);
+                    UnlockVolumes(phys); // after STATE, so the agents scan the drive as an allowed one
                     server.Broadcast("DECIDED", phys, "A", "");
                     break;
                 }
@@ -408,6 +474,7 @@ namespace UsbGuard
                     if (m[3] == "B") { Guard.Block(phys, m[2]); string e = Dev.DisableOrRemove(phys); Guard.Log("Blocked from device list: " + m[2] + (e == null ? "" : " (" + e + ")")); }
                     else { Guard.Allow(phys, m[2], true); string e = Dev.Enable(phys); Guard.Log("Allowed from device list: " + m[2] + (e == null ? "" : " (" + e + ")")); }
                     SendState(phys);
+                    if (m[3] != "B") UnlockVolumes(phys);
                     break;
                 }
 

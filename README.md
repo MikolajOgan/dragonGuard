@@ -17,7 +17,9 @@ adapters (LAN Turtle, PoisonTap, Bash Bunny, P4wnP1) and malicious pendrives.
   keys. Blocked clicks and cursor jumps are shown, and jumps straight to fixed screen positions raise a warning.
 * **New USB network adapter → switched off until you approve it.** This also works on the lock screen and before logon, which
   is exactly when the "steal the password hash from a locked PC" attack happens.
-* **New USB drive → approval window and drive scan.** It shows the contents of any `autorun.inf` (including `open=` /
+* **New USB drive → no drive letter until you approve it, plus a drive scan.** The service removes the drive letter of
+  any USB drive that isn't allowed yet, so it can't be opened in Explorer or by programs. It gets a letter back (the
+  first free one from D:) when you click Allow. The scan reads the drive through its hidden volume path. It shows the contents of any `autorun.inf` (including `open=` /
   `shellexecute=` lines) and lists executables and scripts, shortcuts in the drive root, hidden executables and double
   extensions (`photo.jpg.exe`). Drives from allowed devices are scanned too, and you get a tray warning if something is suspicious.
 * One window per *physical* device, so a gadget that is keyboard + network + storage at once is shown as one device and flagged.

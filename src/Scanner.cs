@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 
@@ -14,6 +15,10 @@ namespace UsbGuard
     }
 
     /// <summary>Looks for autorun.inf, executables/scripts, disguised shortcuts and double extensions on a drive.</summary>
+    /// <remarks>
+    /// Uses the Win32 file APIs directly so it also works on a volume that has no drive letter
+    /// (\\?\Volume{guid}\ - how untrusted drives are kept); System.IO in .NET Framework rejects those paths.
+    /// </remarks>
     internal static class Scanner
     {
         static readonly HashSet<string> Risky = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -29,40 +34,56 @@ namespace UsbGuard
             ".mp3", ".mp4", ".avi", ".zip", ".rar", ".7z"
         };
 
-        public static ScanResult Scan(char letter)
+        const uint ATTR_HIDDEN = 0x2, ATTR_SYSTEM = 0x4, ATTR_DIRECTORY = 0x10, ATTR_REPARSE = 0x400;
+
+        class Entry { public string Name; public uint Attr; public bool IsDir { get { return (Attr & ATTR_DIRECTORY) != 0; } } }
+
+        public static ScanResult Scan(char letter) { return Scan(letter + @":\", letter + ":"); }
+
+        /// <param name="root">"E:\" or "\\?\Volume{guid}\"</param>
+        /// <param name="display">how the drive is named in the report</param>
+        public static ScanResult Scan(string root, string display)
         {
-            string root = letter + @":\";
+            if (!root.EndsWith("\\")) root += "\\";
             var sb = new StringBuilder();
             bool sus = false;
 
-            var di = new DriveInfo(root);
-            for (int i = 0; i < 20 && !SafeReady(di); i++) Thread.Sleep(250);
-            if (!SafeReady(di))
-                return new ScanResult { Report = "Drive " + root + " is not ready / could not be read.", Suspicious = false };
-
-            try
+            var label = new StringBuilder(261);
+            var fs = new StringBuilder(261);
+            uint serial, maxComp, flags;
+            bool ready = false;
+            for (int i = 0; i < 20 && !ready; i++)
             {
-                sb.AppendLine("Drive " + root + "  label \"" + di.VolumeLabel + "\"  " + di.DriveFormat + "  " +
-                              (di.TotalSize / (1024 * 1024)) + " MB");
+                ready = Native.GetVolumeInformationW(root, label, label.Capacity, out serial, out maxComp, out flags, fs, fs.Capacity);
+                if (!ready) Thread.Sleep(250);
             }
-            catch { sb.AppendLine("Drive " + root); }
+            if (!ready)
+                return new ScanResult { Report = "Drive " + display + " is not ready / could not be read.", Suspicious = false };
+
+            ulong free, total, totalFree;
+            string size = Native.GetDiskFreeSpaceExW(root, out free, out total, out totalFree) ? "  " + (total / (1024 * 1024)) + " MB" : "";
+            sb.AppendLine("Drive " + display + "  label \"" + label + "\"  " + fs + size);
 
             // --- autorun.inf ---
-            string autorun = null;
-            try { autorun = Directory.GetFiles(root, "autorun.inf").FirstOrDefault(); } catch { }
+            Entry autorun = List(root).FirstOrDefault(e => !e.IsDir && e.Name.Equals("autorun.inf", StringComparison.OrdinalIgnoreCase));
             if (autorun != null)
             {
                 sus = true;
                 sb.AppendLine();
-                sb.AppendLine("!! AUTORUN.INF FOUND (" + Attr(autorun) + ")");
+                sb.AppendLine("!! AUTORUN.INF FOUND (" + (FileAttributes)autorun.Attr + ")");
                 try
                 {
                     string txt;
-                    using (var r = new StreamReader(autorun, true))
+                    using (var h = Native.CreateFile(root + autorun.Name, 0x80000000 /*GENERIC_READ*/, 1 /*share read*/, IntPtr.Zero, 3 /*OPEN_EXISTING*/, 0, IntPtr.Zero))
                     {
-                        char[] b = new char[8192];
-                        int n = r.Read(b, 0, b.Length);
-                        txt = new string(b, 0, n);
+                        if (h.IsInvalid) throw new IOException("error " + Marshal.GetLastWin32Error());
+                        using (var st = new FileStream(h, FileAccess.Read))
+                        using (var r = new StreamReader(st, true))
+                        {
+                            char[] b = new char[8192];
+                            int n = r.Read(b, 0, b.Length);
+                            txt = new string(b, 0, n);
+                        }
                     }
                     foreach (string raw in txt.Split('\n'))
                     {
@@ -79,39 +100,33 @@ namespace UsbGuard
             // --- files ---
             var findings = new List<string>();
             int scanned = 0;
-            var queue = new Queue<KeyValuePair<string, int>>();
-            queue.Enqueue(new KeyValuePair<string, int>(root, 0));
+            var queue = new Queue<KeyValuePair<string, int>>(); // relative folder ("" = root), depth
+            queue.Enqueue(new KeyValuePair<string, int>("", 0));
             while (queue.Count > 0 && scanned < 5000)
             {
                 var cur = queue.Dequeue();
-                string[] files = new string[0], dirs = new string[0];
-                try { files = Directory.GetFiles(cur.Key); } catch { }
-                try { dirs = Directory.GetDirectories(cur.Key); } catch { }
-
-                foreach (string f in files)
+                foreach (Entry e in List(root + cur.Key))
                 {
+                    string rel = cur.Key + e.Name;
+                    if (e.IsDir)
+                    {
+                        if (cur.Value >= 2 || (e.Attr & ATTR_REPARSE) != 0) continue;
+                        if (e.Name.Equals("System Volume Information", StringComparison.OrdinalIgnoreCase) || e.Name.Equals("$RECYCLE.BIN", StringComparison.OrdinalIgnoreCase)) continue;
+                        queue.Enqueue(new KeyValuePair<string, int>(rel + "\\", cur.Value + 1));
+                        continue;
+                    }
                     scanned++;
-                    string name = Path.GetFileName(f);
-                    string ext = Path.GetExtension(f);
-                    string inner = Path.GetExtension(Path.GetFileNameWithoutExtension(f));
-                    FileAttributes a = 0;
-                    try { a = File.GetAttributes(f); } catch { }
-                    bool hidden = (a & (FileAttributes.Hidden | FileAttributes.System)) != 0;
+                    if (e.Name.Equals("autorun.inf", StringComparison.OrdinalIgnoreCase)) continue;
+                    string ext = Path.GetExtension(e.Name);
+                    string inner = Path.GetExtension(Path.GetFileNameWithoutExtension(e.Name));
+                    bool hidden = (e.Attr & (ATTR_HIDDEN | ATTR_SYSTEM)) != 0;
                     var why = new List<string>();
                     if (Risky.Contains(ext)) why.Add("executable/script");
                     if (Risky.Contains(ext) && Decoy.Contains(inner)) why.Add("DOUBLE EXTENSION");
                     if (cur.Value == 0 && ext.Equals(".lnk", StringComparison.OrdinalIgnoreCase)) why.Add("shortcut in root (USB worm trick)");
                     if (hidden && Risky.Contains(ext)) why.Add("hidden");
-                    if (name.Equals("autorun.inf", StringComparison.OrdinalIgnoreCase)) continue;
-                    if (why.Count > 0) findings.Add(f.Substring(root.Length) + "   <" + string.Join(", ", why) + ">");
+                    if (why.Count > 0) findings.Add(rel + "   <" + string.Join(", ", why) + ">");
                 }
-                if (cur.Value < 2)
-                    foreach (string d in dirs)
-                    {
-                        string dn = Path.GetFileName(d);
-                        if (dn.Equals("System Volume Information", StringComparison.OrdinalIgnoreCase) || dn == "$RECYCLE.BIN") continue;
-                        queue.Enqueue(new KeyValuePair<string, int>(d, cur.Value + 1));
-                    }
             }
 
             sb.AppendLine();
@@ -127,14 +142,23 @@ namespace UsbGuard
             return new ScanResult { Report = sb.ToString(), Suspicious = sus };
         }
 
-        static bool SafeReady(DriveInfo d)
+        /// <summary>Files and folders directly in <paramref name="dir"/> (which ends with a backslash).</summary>
+        static List<Entry> List(string dir)
         {
-            try { return d.IsReady; } catch { return false; }
-        }
-
-        static string Attr(string f)
-        {
-            try { return File.GetAttributes(f).ToString(); } catch { return "?"; }
+            var r = new List<Entry>();
+            Native.WIN32_FIND_DATA d;
+            IntPtr h = Native.FindFirstFileW(dir + "*", out d);
+            if (h == new IntPtr(-1)) return r;
+            try
+            {
+                do
+                {
+                    if (d.cFileName == "." || d.cFileName == "..") continue;
+                    r.Add(new Entry { Name = d.cFileName, Attr = d.dwFileAttributes });
+                } while (Native.FindNextFileW(h, out d));
+            }
+            finally { Native.FindClose(h); }
+            return r;
         }
     }
 }

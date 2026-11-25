@@ -28,10 +28,11 @@ namespace UsbGuard
         readonly HashSet<string> networks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         readonly HashSet<string> pointers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         readonly List<string> toEnable = new List<string>();
-        readonly List<char> drives = new List<char>();
+        readonly List<string> drives = new List<string>();   // "E:" or "no drive letter"
         readonly StringBuilder captured = new StringBuilder();
         readonly List<uint> keyTimes = new List<uint>();
         bool mouseHeld;
+        bool driveLocked;    // the drive is kept without a drive letter until approval
 
         readonly Label lblIfaces, lblLock, lblDisabled, lblSeqHelp, lblStatus, lblInjection, lblNote, lblScanTitle;
         readonly FlowLayoutPanel seqPanel;
@@ -311,13 +312,17 @@ namespace UsbGuard
             storages.Remove(path);
         }
 
-        public void AddDrive(char letter)
+        /// <summary>Returns false if this drive was already added.</summary>
+        public bool AddDrive(string display, bool locked = false)
         {
-            if (!drives.Contains(letter)) drives.Add(letter);
+            if (locked) driveLocked = true;
+            bool added = !drives.Contains(display);
+            if (added) drives.Add(display);
             UpdateView();
+            return added;
         }
 
-        public void SetScan(char letter, ScanResult r)
+        public void SetScan(string display, ScanResult r)
         {
             string prefix = r.Suspicious ? "!! SUSPICIOUS CONTENT\r\n" : "";
             txtScan.Text = prefix + r.Report.Replace("\n", "\r\n").Replace("\r\r", "\r");
@@ -346,7 +351,7 @@ namespace UsbGuard
             if (keyboards.Count > 0) parts.Add("Keyboard" + (keyboards.Count > 1 ? " x" + keyboards.Count : ""));
             if (pointers.Count > 0) parts.Add("Mouse/pointer" + (pointers.Count > 1 ? " x" + pointers.Count : ""));
             if (networks.Count > 0) parts.Add("NETWORK ADAPTER");
-            if (storages.Count > 0) parts.Add("Mass storage" + (drives.Count > 0 ? " (" + string.Join(", ", drives.Select(d => d + ":")) + ")" : ""));
+            if (storages.Count > 0) parts.Add("Mass storage" + (drives.Count > 0 ? " (" + string.Join(", ", drives) + ")" : ""));
             int kinds = (keyboards.Count > 0 ? 1 : 0) + (pointers.Count > 0 ? 1 : 0) + (networks.Count > 0 ? 1 : 0) + (storages.Count > 0 ? 1 : 0);
             string warn = "";
             if (networks.Count > 0 && (keyboards.Count > 0 || storages.Count > 0))
@@ -367,6 +372,7 @@ namespace UsbGuard
             var dis = new List<string>();
             if (pointers.Count > 0 && !mouseHeld && toEnable.Count > 0) dis.Add("✔  The new mouse/pointer is switched off until you approve it - it cannot click or move. Your other mice keep working.");
             if (networks.Count > 0 && toEnable.Count > 0) dis.Add("✔  The new network adapter is switched off until you approve it (stops LAN Turtle / PoisonTap style traffic hijacking and password-hash theft).");
+            if (storages.Count > 0 && driveLocked) dis.Add("✔  The drive has no drive letter until you approve it, so it can't be opened. Its contents are scanned on the right.");
             lblDisabled.Text = string.Join("\r\n", dis);
             lblDisabled.Visible = dis.Count > 0;
 

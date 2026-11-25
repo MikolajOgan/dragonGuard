@@ -169,7 +169,17 @@ namespace UsbGuard
         /// <summary>Physical USB device behind a drive letter, or null.</summary>
         public static string PhysForDrive(char letter)
         {
-            int num = GetStorageDeviceNumber(@"\\.\" + letter + ":");
+            return PhysForDiskNumber(GetStorageDeviceNumber(@"\\.\" + letter + ":"));
+        }
+
+        /// <summary>Physical USB device behind a volume (\\?\Volume{guid}\ or a volume interface path), or null.</summary>
+        public static string PhysForVolume(string volume)
+        {
+            return PhysForDiskNumber(GetStorageDeviceNumber(volume.TrimEnd('\\')));
+        }
+
+        static string PhysForDiskNumber(int num)
+        {
             if (num < 0) return null;
             foreach (string path in GetPresentInterfaces(Native.GUID_DEVINTERFACE_DISK))
             {
@@ -310,6 +320,62 @@ namespace UsbGuard
             for (int i = 0; i < got; i++)
                 if (arr[i].dwType == Native.RIM_TYPEKEYBOARD) list.Add(arr[i].hDevice);
             return list;
+        }
+    }
+
+    /// <summary>
+    /// Drive letters of USB volumes. A drive that is not trusted yet is kept without a drive letter, so it
+    /// can't be opened in Explorer / by programs; DragonGuard scans it through its \\?\Volume{guid}\ path
+    /// and gives it a letter back when it's allowed. Needs admin / SYSTEM.
+    /// </summary>
+    internal static class Volumes
+    {
+        /// <summary>"\\?\Volume{guid}\" for a volume interface path or a mount point like "E:\".</summary>
+        public static string NameOf(string pathOrMountPoint)
+        {
+            string p = pathOrMountPoint.EndsWith("\\") ? pathOrMountPoint : pathOrMountPoint + "\\";
+            var sb = new StringBuilder(64);
+            return Native.GetVolumeNameForVolumeMountPointW(p, sb, sb.Capacity) ? sb.ToString() : null;
+        }
+
+        public static List<string> MountPoints(string volName)
+        {
+            var r = new List<string>();
+            char[] buf = new char[1024];
+            int needed;
+            if (!Native.GetVolumePathNamesForVolumeNameW(volName, buf, buf.Length, out needed)) return r;
+            foreach (string s in new string(buf).Split('\0'))
+                if (s.Length > 0) r.Add(s);
+            return r;
+        }
+
+        /// <summary>Removes the volume's drive letters. Returns the letters removed ("E:") or an empty string.</summary>
+        public static string HideLetters(string volName)
+        {
+            var removed = new List<string>();
+            foreach (string mp in MountPoints(volName))
+                if (mp.Length == 3 && mp[1] == ':')
+                {
+                    if (Native.DeleteVolumeMountPointW(mp)) removed.Add(mp.Substring(0, 2));
+                    else Guard.Log("Could not remove drive letter " + mp + " (error " + Marshal.GetLastWin32Error() + ")");
+                }
+            return string.Join(", ", removed);
+        }
+
+        /// <summary>Gives the volume a drive letter (the first free one from D:) if it has none. Returns it, or null.</summary>
+        public static char? GiveLetter(string volName)
+        {
+            foreach (string mp in MountPoints(volName))
+                if (mp.Length == 3 && mp[1] == ':') return mp[0];
+            uint used = Native.GetLogicalDrives();
+            for (int i = 3; i < 26; i++)
+            {
+                if ((used & (1u << i)) != 0) continue;
+                string mp = (char)('A' + i) + @":\";
+                if (Native.SetVolumeMountPointW(mp, volName)) return mp[0];
+            }
+            Guard.Log("Could not give a drive letter to " + volName + " (error " + Marshal.GetLastWin32Error() + ")");
+            return null;
         }
     }
 }

@@ -73,7 +73,7 @@ Uninstalling keeps these files.
   is recommended.
 * **Uninstall DragonGuard.**
 
-## Limitations (honest)
+## Limitations
 * This is not a filter driver. Devices are switched off as soon as Windows reports them, which in practice happens before an
   attack device acts (they usually wait 0.5–2 s, and a network adapter needs seconds for DHCP). A device that acts within
   milliseconds of being plugged in could in theory get its first keys or clicks through.
